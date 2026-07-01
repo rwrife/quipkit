@@ -1,20 +1,13 @@
-# Binaries
+# Go
 /quipkit
-/dist/
+/bin/
 *.exe
 *.test
 *.out
 
-# Go
-/vendor/
-go.work
-go.work.sum
-
-# Editor / OS
+# IDE
 .idea/
 .vscode/
-.DS_Store
-*~
 
-# Local snippet store (never commit a user's personal snippets)
-.quipkit/
+# OS
+.DS_Store
