@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/rwrife/quipkit/internal/config"
+	"github.com/rwrife/quipkit/internal/match"
 	"github.com/rwrife/quipkit/internal/store"
 )
 
@@ -25,9 +26,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	versionFlag := fs.Bool("version", false, "print version and exit")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "quipkit %s\n", Version)
-		fmt.Fprintln(stderr, "usage: quipkit [--version] [command]")
+		fmt.Fprintln(stderr, "usage: quipkit [--version] [command] [args]")
 		fmt.Fprintln(stderr, "commands:")
-		fmt.Fprintln(stderr, "  list    list snippets (title\\ttags), pipe-friendly")
+		fmt.Fprintln(stderr, "  list           list snippets (title\\ttags), pipe-friendly")
+		fmt.Fprintln(stderr, "  find <query>   fuzzy-rank snippets by query (title\\ttags)")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR or ~/.quipkit")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -59,6 +61,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "list":
 		return cmdList(dir, stdout, stderr)
+	case "find":
+		return cmdFind(dir, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "quipkit: unknown command %q\n", cmd)
 		return 2
@@ -76,6 +80,35 @@ func cmdList(dir string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, s := range snips {
+		fmt.Fprintf(stdout, "%s\t%s\n", s.Title, strings.Join(s.Tags, ","))
+	}
+	return 0
+}
+
+// cmdFind prints snippets ranked by fuzzy relevance to the query.
+// Output format matches `list`: title\ttags (pipe-friendly, stable).
+// An empty/whitespace query behaves like `list`.
+func cmdFind(dir string, args []string, stdout, stderr io.Writer) int {
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query == "" {
+		fmt.Fprintln(stderr, "quipkit: usage: quipkit find <query>")
+		return 2
+	}
+	snips, err := store.Load(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	if len(snips) == 0 {
+		fmt.Fprintf(stderr, "quipkit: no snippets found in %s\n", dir)
+		return 0
+	}
+	ranked := match.Rank(query, snips)
+	if len(ranked) == 0 {
+		fmt.Fprintf(stderr, "quipkit: no matches for %q\n", query)
+		return 0
+	}
+	for _, s := range ranked {
 		fmt.Fprintf(stdout, "%s\t%s\n", s.Title, strings.Join(s.Tags, ","))
 	}
 	return 0

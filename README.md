@@ -18,7 +18,7 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1 scaffold + M2 snippet store landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`) and `quipkit list` prints them (title\ttags). See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1 scaffold + M2 snippet store + M3 fuzzy match core landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`), `quipkit list` prints them (title\ttags), and `quipkit find <query>` prints the same shape ranked by fuzzy relevance. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Build & try
 
@@ -26,6 +26,7 @@ $ quipkit
 make build                        # produces ./quipkit
 ./quipkit --version               # prints version
 ./quipkit list                    # seeds ~/.quipkit on first run, then lists snippets
+./quipkit find addr               # ranked fuzzy search (title > tags > body)
 QUIPKIT_DIR=/tmp/qk ./quipkit list  # use a custom snippet dir
 ```
 
