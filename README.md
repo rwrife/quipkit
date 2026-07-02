@@ -18,14 +18,15 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1 scaffold landed — builds a Go binary that lists snippets in `~/.quipkit` (override with `QUIPKIT_DIR`). See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1 scaffold + M2 snippet store landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`) and `quipkit list` prints them (title\ttags). See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Build & try
 
 ```bash
-make build           # produces ./quipkit
-./quipkit --version  # prints version
-QUIPKIT_DIR=./examples ./quipkit  # lists *.md filenames
+make build                        # produces ./quipkit
+./quipkit --version               # prints version
+./quipkit list                    # seeds ~/.quipkit on first run, then lists snippets
+QUIPKIT_DIR=/tmp/qk ./quipkit list  # use a custom snippet dir
 ```
 
 Or without make: `go build ./cmd/quipkit` / `go run ./cmd/quipkit --version`.
