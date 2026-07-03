@@ -8,13 +8,23 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/rwrife/quipkit/internal/config"
 	"github.com/rwrife/quipkit/internal/match"
 	"github.com/rwrife/quipkit/internal/store"
+	"github.com/rwrife/quipkit/internal/tui"
 )
 
 // Version is the quipkit version string. Overridable via -ldflags "-X main.Version=...".
 var Version = "0.1.0-dev"
+
+// stdoutIsTTY tells the CLI whether the default command should launch
+// the interactive picker or fall back to non-interactive `list` output.
+// Overridable in tests.
+var stdoutIsTTY = func() bool {
+	return isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stdin.Fd())
+}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -28,6 +38,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "quipkit %s\n", Version)
 		fmt.Fprintln(stderr, "usage: quipkit [--version] [command] [args]")
 		fmt.Fprintln(stderr, "commands:")
+		fmt.Fprintln(stderr, "  (default)      launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
 		fmt.Fprintln(stderr, "  list           list snippets (title\\ttags), pipe-friendly")
 		fmt.Fprintln(stderr, "  find <query>   fuzzy-rank snippets by query (title\\ttags)")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR or ~/.quipkit")
@@ -53,12 +64,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	cmd := "list"
+	// Default command depends on whether we have a real terminal. When
+	// piped or redirected, fall back to `list` so `quipkit | grep foo`
+	// keeps working; the TUI would just error on a non-TTY.
+	defaultCmd := "list"
+	if stdoutIsTTY() {
+		defaultCmd = "tui"
+	}
+	cmd := defaultCmd
 	if fs.NArg() > 0 {
 		cmd = fs.Arg(0)
 	}
 
 	switch cmd {
+	case "tui":
+		return cmdTUI(dir, stdout, stderr)
 	case "list":
 		return cmdList(dir, stdout, stderr)
 	case "find":
@@ -110,6 +130,27 @@ func cmdFind(dir string, args []string, stdout, stderr io.Writer) int {
 	}
 	for _, s := range ranked {
 		fmt.Fprintf(stdout, "%s\t%s\n", s.Title, strings.Join(s.Tags, ","))
+	}
+	return 0
+}
+
+// cmdTUI launches the interactive picker. On successful selection, it
+// prints the snippet body to stdout (clipboard integration lands in M5).
+// On cancel or empty state, it exits with 0 and prints nothing.
+func cmdTUI(dir string, stdout, stderr io.Writer) int {
+	snips, err := store.Load(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	res, err := tui.Run(snips)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	if _, err := tui.WriteSelected(stdout, res); err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
 	}
 	return 0
 }
