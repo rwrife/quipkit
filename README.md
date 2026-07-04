@@ -18,17 +18,20 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1 scaffold + M2 snippet store + M3 fuzzy match core landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`), `quipkit list` prints them (title\ttags), and `quipkit find <query>` prints the same shape ranked by fuzzy relevance. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1 scaffold + M2 snippet store + M3 fuzzy match core + M4 TUI picker landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`), running `quipkit` in a terminal opens the interactive fuzzy picker, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. Selecting in the picker prints the snippet body to stdout (clipboard integration is M5). See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Build & try
 
 ```bash
 make build                        # produces ./quipkit
 ./quipkit --version               # prints version
+./quipkit                         # interactive picker (TTY) → prints selected body
 ./quipkit list                    # seeds ~/.quipkit on first run, then lists snippets
 ./quipkit find addr               # ranked fuzzy search (title > tags > body)
 QUIPKIT_DIR=/tmp/qk ./quipkit list  # use a custom snippet dir
 ```
+
+Picker keys: type to filter, ↑/↓ to move, `Enter` to select, `Esc`/`Ctrl-C` to quit. When stdout isn't a TTY (e.g. `quipkit | grep foo`), the default falls back to `list`.
 
 Or without make: `go build ./cmd/quipkit` / `go run ./cmd/quipkit --version`.
 
