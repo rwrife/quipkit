@@ -18,20 +18,30 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1 scaffold + M2 snippet store + M3 fuzzy match core + M4 TUI picker landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`), running `quipkit` in a terminal opens the interactive fuzzy picker, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. Selecting in the picker prints the snippet body to stdout (clipboard integration is M5). See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1–M5 landed — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR`), running `quipkit` in a terminal opens the interactive fuzzy picker, selecting **copies the snippet body to your system clipboard** and prints a `copied "…"` confirmation to stderr. `quipkit add` writes new snippets from the CLI. Pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Build & try
 
 ```bash
 make build                        # produces ./quipkit
 ./quipkit --version               # prints version
-./quipkit                         # interactive picker (TTY) → prints selected body
+./quipkit                         # interactive picker (TTY) → copies pick to clipboard
 ./quipkit list                    # seeds ~/.quipkit on first run, then lists snippets
 ./quipkit find addr               # ranked fuzzy search (title > tags > body)
+./quipkit add "Hey, thanks!" --title "Quick thanks" --tags casual,reply
 QUIPKIT_DIR=/tmp/qk ./quipkit list  # use a custom snippet dir
 ```
 
-Picker keys: type to filter, ↑/↓ to move, `Enter` to select, `Esc`/`Ctrl-C` to quit. When stdout isn't a TTY (e.g. `quipkit | grep foo`), the default falls back to `list`.
+Picker keys: type to filter, ↑/↓ to move, `Enter` to select (copies body to clipboard, exits), `Esc`/`Ctrl-C` to quit. When stdout isn't a TTY (e.g. `quipkit | grep foo`), the default falls back to `list`.
+
+If no clipboard backend is installed (bare Linux server, etc.), `quipkit` prints the snippet body to stdout and a hint to stderr suggesting `xclip` / `xsel` / `wl-clipboard`.
+
+Adding snippets from the CLI:
+
+```bash
+quipkit add "See you tomorrow." --title "Signoff" --tags casual
+echo "multi-line\nbody here" | quipkit add --title "Piped" --tags demo
+```
 
 Or without make: `go build ./cmd/quipkit` / `go run ./cmd/quipkit --version`.
 
