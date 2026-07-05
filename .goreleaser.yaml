@@ -1,0 +1,90 @@
+# .goreleaser.yaml — quipkit release config
+#
+# Produces cross-platform static binaries + checksums on tag pushes.
+# The GitHub Actions release workflow (.github/workflows/release.yml)
+# runs `goreleaser release --clean` on tags matching v*.
+#
+# Local dry-run:   goreleaser release --snapshot --clean --skip=publish
+# Local check:     goreleaser check
+
+version: 2
+
+project_name: quipkit
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: quipkit
+    main: ./cmd/quipkit
+    binary: quipkit
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # No 32-bit / freebsd targets for v0.1 — keep the matrix small so
+    # release output is easy to browse. Add when someone asks.
+    ignore: []
+
+archives:
+  - id: quipkit
+    ids:
+      - quipkit
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - PLAN.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # Keep the release notes tight: features/fixes only, no chore noise.
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: Features
+      regexp: '(?i)^feat(\(.*\))?:'
+      order: 0
+    - title: Fixes
+      regexp: '(?i)^fix(\(.*\))?:'
+      order: 1
+    - title: Other
+      order: 999
+
+release:
+  github:
+    owner: rwrife
+    name: quipkit
+  draft: false
+  prerelease: auto
+  name_template: "quipkit {{ .Version }}"

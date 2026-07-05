@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/mattn/go-isatty"
@@ -36,6 +37,22 @@ var copyToClipboard = clip.Copy
 // Also swappable in tests.
 var clipboardAvailable = clip.Available
 
+// runEditor spawns the configured editor against the given file path.
+// It's a package var so tests can stub it out without invoking a real
+// editor binary.
+var runEditor = func(editor, path string, stdin io.Reader, stdout, stderr io.Writer) error {
+	fields := strings.Fields(editor)
+	if len(fields) == 0 {
+		return fmt.Errorf("editor command is empty")
+	}
+	args := append(fields[1:], path)
+	cmd := exec.Command(fields[0], args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -48,11 +65,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "quipkit %s\n", Version)
 		fmt.Fprintln(stderr, "usage: quipkit [--version] [command] [args]")
 		fmt.Fprintln(stderr, "commands:")
-		fmt.Fprintln(stderr, "  (default)      launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
-		fmt.Fprintln(stderr, "  list           list snippets (title\\ttags), pipe-friendly")
-		fmt.Fprintln(stderr, "  find <query>   fuzzy-rank snippets by query (title\\ttags)")
-		fmt.Fprintln(stderr, "  add <text>     write a new snippet (flags: --title, --tags a,b)")
-		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR or ~/.quipkit")
+		fmt.Fprintln(stderr, "  (default)       launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
+		fmt.Fprintln(stderr, "  list            list snippets (title\\ttags), pipe-friendly")
+		fmt.Fprintln(stderr, "  find <query>    fuzzy-rank snippets by query (title\\ttags)")
+		fmt.Fprintln(stderr, "  add <text>      write a new snippet (flags: --title, --tags a,b)")
+		fmt.Fprintln(stderr, "  edit [query]    open a snippet in $EDITOR (fuzzy picks the top match, or opens picker on a TTY)")
+		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR, config `snippet_dir`, or ~/.quipkit")
+		fmt.Fprintln(stderr, "config file: $XDG_CONFIG_HOME/quipkit/config or ~/.config/quipkit/config")
 	}
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -63,7 +82,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	dir, err := config.SnippetDir()
+	cfgFile, err := config.LoadFile()
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	dir, err := config.ResolveSnippetDir(cfgFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
@@ -96,6 +120,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdFind(dir, fs.Args()[1:], stdout, stderr)
 	case "add":
 		return cmdAdd(dir, fs.Args()[1:], stdout, stderr)
+	case "edit":
+		return cmdEdit(dir, cfgFile, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "quipkit: unknown command %q\n", cmd)
 		return 2
@@ -211,6 +237,105 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+// cmdEdit opens a snippet in the user's configured editor.
+//
+// Resolution order for which snippet to open:
+//  1. --id <id> (exact match by snippet id, i.e. file base name without .md)
+//  2. Positional query → top fuzzy match by title/tags/body
+//  3. No args + TTY → launch the interactive picker; the picked snippet
+//     is the one opened
+//  4. No args + non-TTY → error (nothing to pick from silently)
+//
+// The editor command is resolved via [config.Editor], honoring VISUAL,
+// EDITOR, and the config-file `editor` value in that order.
+func cmdEdit(dir string, cfg config.File, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	id := fs.String("id", "", "open snippet by exact id (file base name)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: quipkit edit [--id ID] [<query>]")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	snips, err := store.Load(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	if len(snips) == 0 {
+		fmt.Fprintf(stderr, "quipkit: no snippets found in %s\n", dir)
+		return 0
+	}
+
+	target, code := resolveEditTarget(snips, *id, fs.Args(), stderr)
+	if code != 0 {
+		return code
+	}
+
+	editor := config.Editor(cfg)
+	if err := runEditor(editor, target.Path, os.Stdin, stdout, stderr); err != nil {
+		fmt.Fprintf(stderr, "quipkit: editor %q failed: %v\n", editor, err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "edited %s (%s)\n", target.Title, target.Path)
+	return 0
+}
+
+// resolveEditTarget picks the snippet to edit based on flags/args and
+// TTY state. It writes any user-facing errors directly to stderr and
+// returns (nil, non-zero) in that case so the caller can propagate the
+// exit code without re-formatting.
+func resolveEditTarget(snips []store.Snippet, id string, args []string, stderr io.Writer) (*store.Snippet, int) {
+	id = strings.TrimSpace(id)
+	if id != "" {
+		for i := range snips {
+			if snips[i].ID == id {
+				return &snips[i], 0
+			}
+		}
+		fmt.Fprintf(stderr, "quipkit: no snippet with id %q\n", id)
+		return nil, 1
+	}
+
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query != "" {
+		ranked := match.Rank(query, snips)
+		if len(ranked) == 0 {
+			fmt.Fprintf(stderr, "quipkit: no matches for %q\n", query)
+			return nil, 1
+		}
+		s := ranked[0]
+		return &s, 0
+	}
+
+	if !stdoutIsTTY() {
+		fmt.Fprintln(stderr, "quipkit: edit needs --id or a query when stdin/stdout aren't a TTY")
+		return nil, 2
+	}
+
+	res, err := tui.Run(snips)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return nil, 1
+	}
+	if res.Selected == nil {
+		// User cancelled — silent 0 exit, same as cmdTUI.
+		return nil, 0
+	}
+	// The picker returns a value-typed snippet, but its ID uniquely
+	// identifies the on-disk file so we re-resolve from the loaded list
+	// to get a stable pointer with the definite Path attached.
+	for i := range snips {
+		if snips[i].ID == res.Selected.ID {
+			return &snips[i], 0
+		}
+	}
+	s := *res.Selected
+	return &s, 0
 }
 
 // cmdTUI launches the interactive picker. On successful selection, it
