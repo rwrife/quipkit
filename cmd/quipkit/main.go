@@ -10,6 +10,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"github.com/rwrife/quipkit/internal/clip"
 	"github.com/rwrife/quipkit/internal/config"
 	"github.com/rwrife/quipkit/internal/match"
 	"github.com/rwrife/quipkit/internal/store"
@@ -26,6 +27,15 @@ var stdoutIsTTY = func() bool {
 	return isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stdin.Fd())
 }
 
+// copyToClipboard is the clipboard entrypoint the CLI actually uses.
+// It's a package var so tests can swap it (and so the fallback path in
+// cmdTUI doesn't have to know about the clip package internals).
+var copyToClipboard = clip.Copy
+
+// clipboardAvailable reports whether the system exposes a clipboard.
+// Also swappable in tests.
+var clipboardAvailable = clip.Available
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -41,6 +51,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  (default)      launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
 		fmt.Fprintln(stderr, "  list           list snippets (title\\ttags), pipe-friendly")
 		fmt.Fprintln(stderr, "  find <query>   fuzzy-rank snippets by query (title\\ttags)")
+		fmt.Fprintln(stderr, "  add <text>     write a new snippet (flags: --title, --tags a,b)")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR or ~/.quipkit")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -83,6 +94,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdList(dir, stdout, stderr)
 	case "find":
 		return cmdFind(dir, fs.Args()[1:], stdout, stderr)
+	case "add":
+		return cmdAdd(dir, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "quipkit: unknown command %q\n", cmd)
 		return 2
@@ -134,9 +147,78 @@ func cmdFind(dir string, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// cmdAdd writes a new snippet. Positional args are joined with spaces to
+// form the body (so both `quipkit add hello world` and
+// `quipkit add "hello world"` work); when there are no positional args
+// and stdin is not a TTY, the body is read from stdin instead so
+// pipelines can pipe text in.
+func cmdAdd(dir string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("add", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	title := fs.String("title", "", "snippet title (frontmatter)")
+	tags := fs.String("tags", "", "comma-separated tags, e.g. work,reply")
+	filename := fs.String("file", "", "explicit filename (default: derived from title/body)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: quipkit add [--title T] [--tags a,b] [--file NAME] <text>")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	body := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if body == "" {
+		// Fall back to stdin so `echo hi | quipkit add --title x` works.
+		if !isatty.IsTerminal(os.Stdin.Fd()) {
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				fmt.Fprintf(stderr, "quipkit: read stdin: %v\n", err)
+				return 1
+			}
+			body = strings.TrimSpace(string(b))
+		}
+	}
+	if body == "" {
+		fmt.Fprintln(stderr, "quipkit: add needs snippet text (as args or on stdin)")
+		fs.Usage()
+		return 2
+	}
+
+	path, err := store.Add(dir, body, store.AddOptions{
+		Title:    *title,
+		Tags:     splitCSV(*tags),
+		Filename: *filename,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "added %s\n", path)
+	return 0
+}
+
+// splitCSV parses a comma-separated flag value into trimmed, non-empty
+// tokens. Kept here (not in store) because it's a CLI concern.
+func splitCSV(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // cmdTUI launches the interactive picker. On successful selection, it
-// prints the snippet body to stdout (clipboard integration lands in M5).
-// On cancel or empty state, it exits with 0 and prints nothing.
+// copies the snippet body to the system clipboard and prints a short
+// confirmation to stderr. When no clipboard backend is available (bare
+// Linux server, etc.) it falls back to printing the body to stdout with
+// a hint on stderr so the user can still pipe or paste manually.
+// On cancel or empty state, it exits 0 with no output.
 func cmdTUI(dir string, stdout, stderr io.Writer) int {
 	snips, err := store.Load(dir)
 	if err != nil {
@@ -148,9 +230,39 @@ func cmdTUI(dir string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
 	}
-	if _, err := tui.WriteSelected(stdout, res); err != nil {
-		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+	if res.Selected == nil {
+		// User cancelled (Esc / Ctrl-C) or empty snippet set. Silent 0.
+		return 0
+	}
+
+	body := res.Selected.Body
+	title := res.Selected.Title
+
+	if !clipboardAvailable() {
+		// No backend — dump the body so the user still gets value out of
+		// their pick, and explain how to get real clipboard support.
+		if _, werr := tui.WriteSelected(stdout, res); werr != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", werr)
+			return 1
+		}
+		// Route via clip.Copy purely to get a consistent hinted error
+		// message across platforms.
+		if err := copyToClipboard(body); err != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		}
+		return 0
+	}
+
+	if err := copyToClipboard(body); err != nil {
+		// Backend claimed available but failed at write time. Still
+		// print the body so the user isn't stuck.
+		fmt.Fprintf(stderr, "quipkit: clipboard copy failed: %v\n", err)
+		if _, werr := tui.WriteSelected(stdout, res); werr != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", werr)
+			return 1
+		}
 		return 1
 	}
+	fmt.Fprintf(stderr, "copied %q to clipboard\n", title)
 	return 0
 }
