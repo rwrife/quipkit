@@ -50,6 +50,21 @@ tags: [apology, casual]
 Sorry about that — my mistake. Fixing now.
 `,
 		},
+		{
+			Filename: "intro.md",
+			Content: `---
+title: Personalized intro
+tags: [intro, work]
+---
+Hi {{name}},
+
+Thanks for reaching out on {{date}}. Happy to chat about {{topic:the project}} —
+let me know what times work.
+
+Cheers,
+{{signature:me}}
+`,
+		},
 	}
 }
 

@@ -254,3 +254,187 @@ func TestWriteSelected_NilSelectedIsNoop(t *testing.T) {
 		t.Errorf("WriteSelected(nil) wrote %q (n=%d), want empty", buf.String(), n)
 	}
 }
+
+func TestWriteSelected_PrefersRenderedOverBody(t *testing.T) {
+	s := &store.Snippet{Body: "Hi {{name}}"}
+	var buf bytes.Buffer
+	if _, err := WriteSelected(&buf, Result{Selected: s, Rendered: "Hi Ryan"}); err != nil {
+		t.Fatalf("WriteSelected err = %v", err)
+	}
+	if got := buf.String(); got != "Hi Ryan\n" {
+		t.Errorf("WriteSelected wrote %q, want %q", got, "Hi Ryan\n")
+	}
+}
+
+// --- placeholder-phase tests ---
+
+func placeholderSnippet() store.Snippet {
+	return store.Snippet{
+		ID:    "hello",
+		Title: "Placeholder greeting",
+		Body:  "Hey {{name}}, welcome to {{team:the team}}!",
+	}
+}
+
+func TestUpdate_EnterOnPlaceholderSnippetEntersPromptPhase(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter)
+	if m.phase != phasePrompt {
+		t.Fatalf("phase = %d, want phasePrompt (%d)", m.phase, phasePrompt)
+	}
+	if m.picked == nil {
+		t.Fatal("picked = nil, want the placeholder snippet")
+	}
+	if m.confirmed {
+		t.Error("confirmed = true too early; prompt phase must not confirm")
+	}
+	if m.quitting {
+		t.Error("quitting = true too early; prompt phase must not quit")
+	}
+	if got, want := len(m.prompts), 2; got != want {
+		t.Errorf("len(prompts) = %d, want %d", got, want)
+	}
+}
+
+func TestUpdate_EnterOnPlainSnippetSkipsPromptPhase(t *testing.T) {
+	m := NewModel([]store.Snippet{{ID: "plain", Title: "Plain", Body: "just text"}})
+	m = key(m, tea.KeyEnter)
+	if m.phase == phasePrompt {
+		t.Error("phase = phasePrompt, want phasePick (no placeholders, no prompt)")
+	}
+	if !m.confirmed {
+		t.Error("confirmed = false, want true (plain snippet must confirm on Enter)")
+	}
+	if !m.quitting {
+		t.Error("quitting = false, want true")
+	}
+}
+
+func TestUpdate_PromptPhase_TabAdvances(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	if m.promptIx != 0 {
+		t.Fatalf("promptIx = %d, want 0", m.promptIx)
+	}
+	m = typeString(m, "Ryan")
+	m = key(m, tea.KeyTab)
+	if m.promptIx != 1 {
+		t.Errorf("promptIx after Tab = %d, want 1", m.promptIx)
+	}
+	if m.prompts[0].Focused() {
+		t.Error("prompts[0] should be blurred after Tab")
+	}
+	if !m.prompts[1].Focused() {
+		t.Error("prompts[1] should be focused after Tab")
+	}
+}
+
+func TestUpdate_PromptPhase_EnterOnLastConfirms(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	m = typeString(m, "Ryan")
+	m = key(m, tea.KeyEnter) // next prompt (team)
+	if m.confirmed {
+		t.Fatal("confirmed after first Enter; want false (still on team prompt)")
+	}
+	m = typeString(m, "eng")
+	m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = m2.(Model)
+	if !m.confirmed {
+		t.Error("confirmed = false, want true after final Enter")
+	}
+	if !m.quitting {
+		t.Error("quitting = false, want true after final Enter")
+	}
+	if cmd == nil {
+		t.Error("final Enter should dispatch tea.Quit (non-nil cmd)")
+	}
+	if got, want := m.renderedBody(), "Hey Ryan, welcome to eng!"; got != want {
+		t.Errorf("renderedBody = %q, want %q", got, want)
+	}
+}
+
+func TestUpdate_PromptPhase_InlineDefaultUsedOnEmpty(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	m = typeString(m, "Ryan")
+	m = key(m, tea.KeyEnter) // move to team prompt (empty)
+	// Don't type anything — pressing Enter with empty input must accept
+	// the inline default ("the team").
+	if got := m.prompts[1].Value(); got != "" {
+		t.Errorf("prompts[1] should start empty (default shown as ghost text); got %q", got)
+	}
+	m = key(m, tea.KeyEnter)
+	if !m.confirmed {
+		t.Fatal("confirmed = false")
+	}
+	if got, want := m.renderedBody(), "Hey Ryan, welcome to the team!"; got != want {
+		t.Errorf("renderedBody = %q, want %q", got, want)
+	}
+}
+
+func TestUpdate_PromptPhase_EscCancelsBackToPicker(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	m = typeString(m, "Ryan")
+	m = key(m, tea.KeyEsc)
+	if m.phase == phasePrompt {
+		t.Error("phase still phasePrompt after Esc")
+	}
+	if m.picked != nil {
+		t.Error("picked should be cleared after Esc back to picker")
+	}
+	if m.confirmed {
+		t.Error("confirmed = true after Esc; want false")
+	}
+	if m.quitting {
+		t.Error("quitting = true after Esc; want false (Esc in prompt phase only returns to picker)")
+	}
+}
+
+func TestUpdate_PromptPhase_CtrlCQuits(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = m2.(Model)
+	if !m.quitting {
+		t.Error("quitting = false after Ctrl-C in prompt phase")
+	}
+	if m.confirmed {
+		t.Error("Ctrl-C must not confirm")
+	}
+}
+
+func TestUpdate_PromptPhase_ShiftTabGoesBack(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	m = typeString(m, "Ryan")
+	m = key(m, tea.KeyTab) // move to team prompt
+	if m.promptIx != 1 {
+		t.Fatalf("promptIx = %d, want 1", m.promptIx)
+	}
+	m = key(m, tea.KeyShiftTab)
+	if m.promptIx != 0 {
+		t.Errorf("promptIx after ShiftTab = %d, want 0", m.promptIx)
+	}
+}
+
+func TestView_PromptPhase_ShowsPromptsAndPreview(t *testing.T) {
+	m := NewModel([]store.Snippet{placeholderSnippet()})
+	m2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = m2.(Model)
+	m = key(m, tea.KeyEnter) // enter prompt phase
+	out := m.View()
+	if !strings.Contains(out, "fill placeholders") {
+		t.Errorf("View() missing header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "name") || !strings.Contains(out, "team") {
+		t.Errorf("View() missing prompt names; got:\n%s", out)
+	}
+	// Type into the first prompt and confirm the live preview updates.
+	m = typeString(m, "Ryan")
+	out = m.View()
+	if !strings.Contains(out, "Hey Ryan") {
+		t.Errorf("View() live preview should show typed value; got:\n%s", out)
+	}
+}
