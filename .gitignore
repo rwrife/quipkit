@@ -1,6 +1,7 @@
 # Go
 /quipkit
 /bin/
+/dist/
 *.exe
 *.test
 *.out
