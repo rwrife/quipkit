@@ -186,3 +186,81 @@ func TestEditorPrecedence(t *testing.T) {
 		t.Fatalf("default want vi, got %q", got)
 	}
 }
+
+func TestLoadFileParsesAutoType(t *testing.T) {
+	_, path := withConfigDir(t)
+	body := "auto_type = yes\ntype_delay_ms = 15\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatalf("LoadFile err: %v", err)
+	}
+	if !got.AutoType || !got.AutoTypeSet {
+		t.Errorf("AutoType=%v AutoTypeSet=%v, want both true", got.AutoType, got.AutoTypeSet)
+	}
+	if got.TypeDelayMs != 15 {
+		t.Errorf("TypeDelayMs = %d, want 15", got.TypeDelayMs)
+	}
+}
+
+func TestLoadFileAutoTypeAcceptsAliases(t *testing.T) {
+	// The `type` alias is what users are likely to reach for first. Also
+	// covers the false path ("off" as an alias for no).
+	_, path := withConfigDir(t)
+	if err := os.WriteFile(path, []byte("type: off\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatalf("LoadFile err: %v", err)
+	}
+	if got.AutoType || !got.AutoTypeSet {
+		t.Errorf("AutoType=%v AutoTypeSet=%v, want false/true", got.AutoType, got.AutoTypeSet)
+	}
+}
+
+func TestLoadFileRejectsBadAutoType(t *testing.T) {
+	_, path := withConfigDir(t)
+	if err := os.WriteFile(path, []byte("auto_type = maybe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadFile()
+	if err == nil {
+		t.Fatal("want error for non-boolean auto_type, got nil")
+	}
+	if !strings.Contains(err.Error(), "boolean") {
+		t.Errorf("err = %v, want boolean complaint", err)
+	}
+}
+
+func TestLoadFileRejectsBadTypeDelay(t *testing.T) {
+	_, path := withConfigDir(t)
+	if err := os.WriteFile(path, []byte("type_delay_ms = fast\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadFile()
+	if err == nil {
+		t.Fatal("want error for non-numeric type_delay_ms, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-negative integer") {
+		t.Errorf("err = %v, want integer complaint", err)
+	}
+}
+
+func TestLoadFileAutoTypeAbsentLeavesSetFalse(t *testing.T) {
+	// Absent auto_type must leave AutoTypeSet=false so the CLI knows
+	// there's no config-level opinion.
+	_, path := withConfigDir(t)
+	if err := os.WriteFile(path, []byte("editor = vim\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatalf("LoadFile err: %v", err)
+	}
+	if got.AutoTypeSet {
+		t.Errorf("AutoTypeSet = true, want false when key absent")
+	}
+}
