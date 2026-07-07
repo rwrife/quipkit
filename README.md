@@ -109,6 +109,41 @@ tags: [casual, reply]
 Thanks so much for thinking of me! I can't make this one, but keep me in the loop.
 ```
 
+## Placeholders
+
+Snippet bodies can contain `{{token}}` (or `{{token:default}}`) markers. When you pick a snippet, quipkit fills them in before copying:
+
+```markdown
+---
+title: Personalized intro
+---
+Hi {{name}},
+
+Thanks for reaching out on {{date}}. Happy to chat about {{topic:the project}}.
+
+Cheers,
+{{signature:me}}
+```
+
+- **Auto-filled tokens** (no prompt): `date`, `time`, `datetime`, `year`, `month`, `day`, `now`, `user`.
+- **Inline defaults** (`{{topic:the project}}`) are shown as ghost text — Tab / Enter without typing accepts them.
+- **Unknown tokens** get a one-input-per-token prompt after you pick, with a live preview of the rendered snippet. `Esc` bails back to the picker.
+- **Literal `{{...}}`** — escape with a leading backslash: `\{{example}}` renders as `{{example}}`.
+
+### Shared vars
+
+Drop a `vars.yaml` (or `vars.yml`) in your snippet dir to pre-fill any token across every snippet:
+
+```yaml
+# ~/.quipkit/vars.yaml
+name:      Ryan
+signature: |
+  -- Ryan (sent from quipkit)
+team:      platform
+```
+
+Values in `vars.yaml` don't override anything you set at prompt time — they're just baseline defaults so common tokens (your name, signature, team) don't get asked about every time. Syntax matches the config file: `key: value` / `key = value`, `#` for comments, values may be quoted.
+
 ## Tech
 
 Go · Bubble Tea TUI · fuzzy match · cross-platform clipboard. One static binary. No server.

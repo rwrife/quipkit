@@ -14,6 +14,7 @@ import (
 	"github.com/rwrife/quipkit/internal/clip"
 	"github.com/rwrife/quipkit/internal/config"
 	"github.com/rwrife/quipkit/internal/match"
+	"github.com/rwrife/quipkit/internal/placeholders"
 	"github.com/rwrife/quipkit/internal/store"
 	"github.com/rwrife/quipkit/internal/tui"
 )
@@ -339,18 +340,33 @@ func resolveEditTarget(snips []store.Snippet, id string, args []string, stderr i
 }
 
 // cmdTUI launches the interactive picker. On successful selection, it
-// copies the snippet body to the system clipboard and prints a short
-// confirmation to stderr. When no clipboard backend is available (bare
-// Linux server, etc.) it falls back to printing the body to stdout with
-// a hint on stderr so the user can still pipe or paste manually.
-// On cancel or empty state, it exits 0 with no output.
+// renders any {{placeholders}} in the snippet body (using autofill
+// values, an optional vars.yaml in the snippet dir, and any prompts
+// the picker collected) and copies the result to the clipboard. When
+// no clipboard backend is available (bare Linux server, etc.) it falls
+// back to printing the rendered body to stdout with a hint on stderr
+// so the user can still pipe or paste manually. On cancel or empty
+// state, it exits 0 with no output.
 func cmdTUI(dir string, stdout, stderr io.Writer) int {
 	snips, err := store.Load(dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
 	}
-	res, err := tui.Run(snips)
+
+	// Build the substitution map: built-in autofills first, then
+	// vars.yaml overrides / additions. Prompt values collected by the
+	// picker (in the placeholder phase) always win because they’re
+	// applied last, via [tui.Model.Update].
+	vals := placeholders.NewValues()
+	vals.Autofill()
+	if err := vals.LoadVars(dir); err != nil {
+		// Surface a broken vars file but keep running — without vars,
+		// the picker will just prompt for the tokens instead.
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+	}
+
+	res, err := tui.RunWithOptions(snips, tui.Options{Values: vals})
 	if err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
@@ -360,7 +376,10 @@ func cmdTUI(dir string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	body := res.Selected.Body
+	body := res.Rendered
+	if body == "" {
+		body = res.Selected.Body
+	}
 	title := res.Selected.Title
 
 	if !clipboardAvailable() {
