@@ -243,3 +243,150 @@ func contains(xs []string, want string) bool {
 	}
 	return false
 }
+
+// --- Frecency-aware ranking -------------------------------------------------
+
+// TestRankWithNilFrecencyMatchesRank makes sure the frecency-aware entry
+// point is a drop-in replacement when the caller doesn't opt in.
+func TestRankWithNilFrecencyMatchesRank(t *testing.T) {
+	in := []store.Snippet{
+		mkSnip("a", "Alpha", nil, "hello there"),
+		mkSnip("b", "Beta hello", nil, "unrelated"),
+		mkSnip("c", "Gamma", nil, "nope"),
+	}
+	gotA := Rank("hello", in)
+	gotB := RankWithFrecency("hello", in, nil)
+	if len(gotA) != len(gotB) {
+		t.Fatalf("lengths differ: %d vs %d", len(gotA), len(gotB))
+	}
+	for i := range gotA {
+		if gotA[i].ID != gotB[i].ID {
+			t.Fatalf("mismatch at %d: %s vs %s", i, gotA[i].ID, gotB[i].ID)
+		}
+	}
+}
+
+// TestRankEmptyQueryFrecencyOrder confirms the empty-query "most-used
+// first" path.
+func TestRankEmptyQueryFrecencyOrder(t *testing.T) {
+	in := []store.Snippet{
+		mkSnip("a", "Alpha", nil, ""),
+		mkSnip("b", "Beta", nil, ""),
+		mkSnip("c", "Gamma", nil, ""),
+	}
+	scores := map[string]float64{
+		"a": 1.0,
+		"b": 5.0,
+		"c": 0.0,
+	}
+	frec := func(id string) float64 { return scores[id] }
+	got := RankWithFrecency("", in, frec)
+	if len(got) != 3 {
+		t.Fatalf("want 3 rows, got %d", len(got))
+	}
+	if got[0].ID != "b" || got[1].ID != "a" || got[2].ID != "c" {
+		t.Fatalf("empty-query frecency order wrong: %v", ids(got))
+	}
+}
+
+// TestRankEmptyQueryNoFrecencyPreservesInputOrder locks in the
+// no-signal case: when nothing has been used yet, the picker stays
+// with the store's ID-sorted order.
+func TestRankEmptyQueryNoFrecencyPreservesInputOrder(t *testing.T) {
+	in := []store.Snippet{
+		mkSnip("a", "Alpha", nil, ""),
+		mkSnip("b", "Beta", nil, ""),
+	}
+	frec := func(string) float64 { return 0 }
+	got := RankWithFrecency("", in, frec)
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("no-frecency empty-query order wrong: %v", ids(got))
+	}
+}
+
+// TestRankFrecencyBreaksTiesWithinQuery is the mainstream case: two
+// snippets that would otherwise tie should be reordered by frecency.
+func TestRankFrecencyBreaksTiesWithinQuery(t *testing.T) {
+	in := []store.Snippet{
+		// Both snippets have the query as an exact title token, so their
+		// base fuzzy+bonus scores match. Only frecency separates them.
+		mkSnip("cold", "hello", nil, ""),
+		mkSnip("hot", "hello", nil, ""),
+	}
+	frec := func(id string) float64 {
+		if id == "hot" {
+			return 3.0
+		}
+		return 0
+	}
+	got := RankWithFrecency("hello", in, frec)
+	if len(got) != 2 || got[0].ID != "hot" {
+		t.Fatalf("frecency tie-break failed: %v", ids(got))
+	}
+}
+
+// TestRankFrecencyDoesNotOverpowerExactTitleToken ensures that a very
+// popular but weakly-matching snippet cannot leapfrog a snippet whose
+// title contains the query as a whole word. This is the guardrail
+// against "once you use it, you can never search past it."
+func TestRankFrecencyDoesNotOverpowerExactTitleToken(t *testing.T) {
+	in := []store.Snippet{
+		// Only a fuzzy body hit — no title token, no tag — but immensely
+		// popular.
+		mkSnip("popular", "Unrelated title", nil, "vpn is mentioned here somewhere"),
+		// Exact title-token hit, brand new.
+		mkSnip("fresh", "VPN setup", nil, ""),
+	}
+	frec := func(id string) float64 {
+		if id == "popular" {
+			return 50.0 // huge popularity
+		}
+		return 0
+	}
+	got := RankWithFrecency("vpn", in, frec)
+	if len(got) == 0 || got[0].ID != "fresh" {
+		t.Fatalf("popularity outranked exact title token: %v", ids(got))
+	}
+}
+
+// TestRankEmptyQueryStableTie ensures two snippets with the same
+// non-zero frecency score keep their input order.
+func TestRankEmptyQueryStableTie(t *testing.T) {
+	in := []store.Snippet{
+		mkSnip("a", "Alpha", nil, ""),
+		mkSnip("b", "Beta", nil, ""),
+		mkSnip("c", "Gamma", nil, ""),
+	}
+	frec := func(id string) float64 {
+		if id == "a" || id == "b" {
+			return 2.0
+		}
+		return 0
+	}
+	got := RankWithFrecency("", in, frec)
+	if len(got) != 3 {
+		t.Fatalf("want 3 rows, got %d", len(got))
+	}
+	if got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "c" {
+		t.Fatalf("stable tie ordering wrong: %v", ids(got))
+	}
+}
+
+// TestRankNonEmptyQueryStillDropsNonMatches confirms frecency doesn't
+// resurrect snippets that don't textually match at all.
+func TestRankNonEmptyQueryStillDropsNonMatches(t *testing.T) {
+	in := []store.Snippet{
+		mkSnip("a", "Mailing address", nil, "123 Main St"),
+		mkSnip("b", "Weather chit-chat", nil, "Nice day out"),
+	}
+	frec := func(id string) float64 {
+		if id == "b" {
+			return 999 // popular but irrelevant
+		}
+		return 0
+	}
+	got := RankWithFrecency("addr", in, frec)
+	if len(got) != 1 || got[0].ID != "a" {
+		t.Fatalf("frecency resurrected a non-match: %v", ids(got))
+	}
+}

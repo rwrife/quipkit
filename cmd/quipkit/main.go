@@ -14,6 +14,7 @@ import (
 
 	"github.com/rwrife/quipkit/internal/clip"
 	"github.com/rwrife/quipkit/internal/config"
+	"github.com/rwrife/quipkit/internal/frecency"
 	"github.com/rwrife/quipkit/internal/match"
 	"github.com/rwrife/quipkit/internal/placeholders"
 	"github.com/rwrife/quipkit/internal/store"
@@ -82,6 +83,23 @@ var typeAvailable = typeit.Available
 // line so users can see which tool actually did the typing.
 var typeBackendName = func() string { return typeit.Detect().Name }
 
+// timeNow returns the current wall-clock time. It's a package var so
+// tests can pin time-of-day when they exercise the frecency-aware
+// commands.
+var timeNow = time.Now
+
+// loadFrecency reads the frecency state from dir. Errors are surfaced
+// via stderr but non-fatal: quipkit should degrade to plain fuzzy
+// ranking rather than refusing to run because of a corrupt state file.
+func loadFrecency(dir string, stderr io.Writer) *frecency.Values {
+	v, err := frecency.Load(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v (frecency ranking disabled)\n", err)
+		return frecency.NewValues()
+	}
+	return v
+}
+
 // runEditor spawns the configured editor against the given file path.
 // It's a package var so tests can stub it out without invoking a real
 // editor binary.
@@ -118,6 +136,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  find <query>    fuzzy-rank snippets by query (title\\ttags)")
 		fmt.Fprintln(stderr, "  add <text>      write a new snippet (flags: --title, --tags a,b)")
 		fmt.Fprintln(stderr, "  edit [query]    open a snippet in $EDITOR (fuzzy picks the top match, or opens picker on a TTY)")
+		fmt.Fprintln(stderr, "  stats [--limit N] show most-used snippets by frecency")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR, config `snippet_dir`, or ~/.quipkit")
 		fmt.Fprintln(stderr, "config file: $XDG_CONFIG_HOME/quipkit/config or ~/.config/quipkit/config")
 		fmt.Fprintln(stderr, "auto-type: --type / --no-type (config `auto_type`), --type-delay-ms (config `type_delay_ms`)")
@@ -183,6 +202,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdAdd(dir, fs.Args()[1:], stdout, stderr)
 	case "edit":
 		return cmdEdit(dir, cfgFile, fs.Args()[1:], stdout, stderr)
+	case "stats":
+		return cmdStats(dir, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "quipkit: unknown command %q\n", cmd)
 		return 2
@@ -223,7 +244,7 @@ func cmdFind(dir string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "quipkit: no snippets found in %s\n", dir)
 		return 0
 	}
-	ranked := match.Rank(query, snips)
+	ranked := match.RankWithFrecency(query, snips, loadFrecency(dir, stderr).Score)
 	if len(ranked) == 0 {
 		fmt.Fprintf(stderr, "quipkit: no matches for %q\n", query)
 		return 0
@@ -332,7 +353,7 @@ func cmdEdit(dir string, cfg config.File, args []string, stdout, stderr io.Write
 		return 0
 	}
 
-	target, code := resolveEditTarget(snips, *id, fs.Args(), stderr)
+	target, code := resolveEditTarget(snips, *id, fs.Args(), loadFrecency(dir, stderr).Score, stderr)
 	if code != 0 {
 		return code
 	}
@@ -349,8 +370,11 @@ func cmdEdit(dir string, cfg config.File, args []string, stdout, stderr io.Write
 // resolveEditTarget picks the snippet to edit based on flags/args and
 // TTY state. It writes any user-facing errors directly to stderr and
 // returns (nil, non-zero) in that case so the caller can propagate the
-// exit code without re-formatting.
-func resolveEditTarget(snips []store.Snippet, id string, args []string, stderr io.Writer) (*store.Snippet, int) {
+// exit code without re-formatting. The frec argument, when non-nil,
+// blends frecency into the query-driven top-match lookup so `quipkit
+// edit foo` picks the *foo* you edit most often rather than merely the
+// first alphabetically-tied match.
+func resolveEditTarget(snips []store.Snippet, id string, args []string, frec match.FrecencyFn, stderr io.Writer) (*store.Snippet, int) {
 	id = strings.TrimSpace(id)
 	if id != "" {
 		for i := range snips {
@@ -364,7 +388,7 @@ func resolveEditTarget(snips []store.Snippet, id string, args []string, stderr i
 
 	query := strings.TrimSpace(strings.Join(args, " "))
 	if query != "" {
-		ranked := match.Rank(query, snips)
+		ranked := match.RankWithFrecency(query, snips, frec)
 		if len(ranked) == 0 {
 			fmt.Fprintf(stderr, "quipkit: no matches for %q\n", query)
 			return nil, 1
@@ -422,6 +446,18 @@ func cmdTUI(dir string, cfg config.File, opts tuiOptions, stdout, stderr io.Writ
 		return 1
 	}
 
+	// Load frecency state (best-effort) so the picker can bubble the
+	// user's most-used snippets to the top and blend recency into query
+	// results. A corrupt file is surfaced but never fatal.
+	frec := loadFrecency(dir, stderr)
+
+	// Order the snippet list before handing it to the picker so both the
+	// initial (empty-query) view and every intermediate filter benefit
+	// from frecency. The TUI's own live filter runs match.Rank over the
+	// same slice, so on later keystrokes the ordering is regenerated
+	// from the input order — which is now frecency-ordered.
+	snips = match.RankWithFrecency("", snips, frec.Score)
+
 	// Build the substitution map: built-in autofills first, then
 	// vars.yaml overrides / additions. Prompt values collected by the
 	// picker (in the placeholder phase) always win because they’re
@@ -442,6 +478,16 @@ func cmdTUI(dir string, cfg config.File, opts tuiOptions, stdout, stderr io.Writ
 	if res.Selected == nil {
 		// User cancelled (Esc / Ctrl-C) or empty snippet set. Silent 0.
 		return 0
+	}
+
+	// Record the selection so it counts toward frecency on the next
+	// run. We do this before delivery: even if the clipboard write
+	// fails, the user did pick this snippet, and skipping the record
+	// would understate their usage.
+	frec.Record(res.Selected.ID, timeNow())
+	if err := frec.Save(dir); err != nil {
+		// Non-fatal — warn but keep going; the pick is still delivered.
+		fmt.Fprintf(stderr, "quipkit: could not update frecency state: %v\n", err)
 	}
 
 	body := res.Rendered
@@ -535,4 +581,86 @@ func resolveTypeDelay(cliMs, cfgMs int) time.Duration {
 		return time.Duration(cfgMs) * time.Millisecond
 	}
 	return 0
+}
+
+// cmdStats prints the most-frequently-used snippets from the local
+// frecency state. It's read-only — running `quipkit stats` never
+// touches the state file, so it's safe to run from a heartbeat or a
+// scripted dashboard. When no snippets have been picked yet, it exits
+// 0 with an explanatory line on stderr instead of an empty table so
+// the user knows the feature exists.
+//
+// Output format is title\tcount\tage, chosen to match the pipe-friendly
+// tab-separated style used by `list` and `find`. Age is a compact
+// relative string ("3h ago", "2d ago", "never") so a `stats | sort`
+// is still sensible.
+func cmdStats(dir string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	limit := fs.Int("limit", 10, "maximum rows to print (0 = all)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: quipkit stats [--limit N]")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *limit < 0 {
+		fmt.Fprintln(stderr, "quipkit: --limit must be >= 0")
+		return 2
+	}
+
+	snips, err := store.Load(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 1
+	}
+	// Build a title lookup so we don't have to bake title into the
+	// state file (which would be stale the moment the user renames a
+	// snippet). Frecency keys on ID; we resolve to title here.
+	titles := make(map[string]string, len(snips))
+	for _, s := range snips {
+		titles[s.ID] = s.Title
+	}
+
+	frec := loadFrecency(dir, stderr)
+	top := frec.TopAt(timeNow(), *limit)
+	if len(top) == 0 {
+		fmt.Fprintln(stderr, "quipkit: no usage recorded yet — pick a snippet with the TUI to populate stats")
+		return 0
+	}
+	for _, row := range top {
+		title, ok := titles[row.ID]
+		if !ok {
+			// The snippet the state file remembers no longer exists on
+			// disk. Flag it so the user can prune stale entries by hand
+			// (rare enough that we don't auto-clean).
+			title = row.ID + " (missing)"
+		}
+		fmt.Fprintf(stdout, "%s\t%d\t%s\n", title, row.Count, relTime(timeNow(), row.LastUsed))
+	}
+	return 0
+}
+
+// relTime formats how long ago last was, relative to now. It's a
+// compact humanized string designed to fit into a tab-separated stats
+// line ("3h ago", "2d ago", etc.). The zero value renders as "never".
+func relTime(now, last time.Time) string {
+	if last.IsZero() || last.Unix() == 0 {
+		return "never"
+	}
+	delta := now.Sub(last)
+	if delta < 0 {
+		delta = 0
+	}
+	switch {
+	case delta < time.Minute:
+		return "just now"
+	case delta < time.Hour:
+		return fmt.Sprintf("%dm ago", int(delta.Minutes()))
+	case delta < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(delta.Hours()))
+	case delta < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(delta.Hours()/24))
+	}
+	return fmt.Sprintf("%dmo ago", int(delta.Hours()/(24*30)))
 }

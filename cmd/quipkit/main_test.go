@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -338,3 +339,202 @@ func TestTypingWiring_UnavailableIsReported(t *testing.T) {
 		t.Errorf("typeBackendName() = %q, want empty", typeBackendName())
 	}
 }
+
+// --- Frecency + stats -----------------------------------------------------
+
+// withPinnedTime pins the CLI-visible "now" so frecency-driven tests
+// aren't racing with the wall clock. Restores the original clock on
+// cleanup.
+func withPinnedTime(t *testing.T, now time.Time) {
+	t.Helper()
+	prev := timeNow
+	timeNow = func() time.Time { return now }
+	t.Cleanup(func() { timeNow = prev })
+}
+
+// writeState is a small helper that drops a hand-rolled state file into
+// dir. Using JSON directly (rather than going through frecency.Save)
+// keeps the test independent from that package's internals — the CLI
+// only needs to know that the file exists and parses.
+func writeState(t *testing.T, dir, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".state.json"), []byte(contents), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+}
+
+func TestRun_Stats_EmptyStateExitsCleanly(t *testing.T) {
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"stats"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("stats exit = %d, want 0 (stderr=%q)", code, errBuf.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stats stdout should be empty, got %q", out.String())
+	}
+	if !strings.Contains(errBuf.String(), "no usage recorded") {
+		t.Fatalf("stats stderr should hint at empty state, got %q", errBuf.String())
+	}
+}
+
+func TestRun_Stats_RanksAndLimits(t *testing.T) {
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+
+	// Seed a couple of on-disk snippets so titles resolve.
+	if err := os.WriteFile(filepath.Join(dir, "alpha.md"), []byte("---\ntitle: Alpha\n---\nA\n"), 0o644); err != nil {
+		t.Fatalf("seed alpha: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "beta.md"), []byte("---\ntitle: Beta\n---\nB\n"), 0o644); err != nil {
+		t.Fatalf("seed beta: %v", err)
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	withPinnedTime(t, now)
+
+	// Beta is used far more, at the same instant — must sort first.
+	writeState(t, dir, `{
+  "entries": {
+    "alpha": {"count": 1, "last_used_unix": `+timestamp(now.Add(-time.Hour))+`},
+    "beta":  {"count": 8, "last_used_unix": `+timestamp(now.Add(-time.Minute))+`}
+  }
+}`)
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"stats", "--limit", "1"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("stats exit = %d, want 0 (stderr=%q)", code, errBuf.String())
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("limit=1 expected 1 line, got %d: %q", len(lines), out.String())
+	}
+	if !strings.HasPrefix(lines[0], "Beta\t8\t") {
+		t.Fatalf("expected Beta as top row, got %q", lines[0])
+	}
+}
+
+func TestRun_Stats_MissingSnippetIsFlagged(t *testing.T) {
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+
+	now := time.Unix(1_700_000_000, 0)
+	withPinnedTime(t, now)
+
+	// State refers to a snippet that no longer exists on disk.
+	writeState(t, dir, `{
+  "entries": {
+    "ghost": {"count": 3, "last_used_unix": `+timestamp(now.Add(-2*time.Hour))+`}
+  }
+}`)
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"stats"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("stats exit = %d (stderr=%q)", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "ghost (missing)") {
+		t.Fatalf("missing snippet should be flagged, got %q", out.String())
+	}
+}
+
+func TestRun_Stats_NegativeLimitRejected(t *testing.T) {
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+	var out, errBuf bytes.Buffer
+	code := run([]string{"stats", "--limit", "-1"}, &out, &errBuf)
+	if code != 2 {
+		t.Fatalf("stats --limit -1 exit = %d, want 2 (stderr=%q)", code, errBuf.String())
+	}
+}
+
+func TestRelTime(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name string
+		last time.Time
+		want string
+	}{
+		{"never", time.Time{}, "never"},
+		{"zero-unix", time.Unix(0, 0), "never"},
+		{"just now", now.Add(-10 * time.Second), "just now"},
+		{"minutes", now.Add(-3 * time.Minute), "3m ago"},
+		{"hours", now.Add(-5 * time.Hour), "5h ago"},
+		{"days", now.Add(-4 * 24 * time.Hour), "4d ago"},
+		{"months", now.Add(-90 * 24 * time.Hour), "3mo ago"},
+		{"future clamps to just now", now.Add(time.Hour), "just now"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := relTime(now, c.last); got != c.want {
+				t.Fatalf("relTime(%v) = %q want %q", c.last, got, c.want)
+			}
+		})
+	}
+}
+
+// TestRun_FindFrecencyReordersWhenScoresTie exercises the CLI end-to-end
+// and asserts that when two snippets tie on textual score, frecency
+// promotes the more-used one.
+func TestRun_FindFrecencyReordersWhenScoresTie(t *testing.T) {
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+
+	// Both snippets carry an exact tag-token match for "vpn" but have
+	// different titles so we can eyeball the ordering.
+	if err := os.WriteFile(filepath.Join(dir, "a-cold.md"),
+		[]byte("---\ntitle: Cold VPN notes\ntags: [vpn]\n---\nzz\n"), 0o644); err != nil {
+		t.Fatalf("seed cold: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b-hot.md"),
+		[]byte("---\ntitle: Hot VPN notes\ntags: [vpn]\n---\nzz\n"), 0o644); err != nil {
+		t.Fatalf("seed hot: %v", err)
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	withPinnedTime(t, now)
+	writeState(t, dir, `{
+  "entries": {
+    "b-hot": {"count": 4, "last_used_unix": `+timestamp(now.Add(-30*time.Minute))+`}
+  }
+}`)
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"find", "vpn"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("find exit = %d (stderr=%q)", code, errBuf.String())
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %v", len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[0], "Hot VPN notes\t") {
+		t.Fatalf("frecency did not reorder tied matches: %q", lines)
+	}
+}
+
+// TestLoadFrecency_MalformedIsNonFatal makes sure a corrupt state file
+// doesn't wedge the CLI — it should surface the error and fall back
+// to an empty in-memory state.
+func TestLoadFrecency_MalformedIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	writeState(t, dir, `{not-json`)
+	var errBuf bytes.Buffer
+	v := loadFrecency(dir, &errBuf)
+	if v == nil {
+		t.Fatal("loadFrecency returned nil on error")
+	}
+	if len(v.Entries) != 0 {
+		t.Fatalf("expected empty fallback, got %+v", v.Entries)
+	}
+	if !strings.Contains(errBuf.String(), "frecency ranking disabled") {
+		t.Fatalf("expected warning, got %q", errBuf.String())
+	}
+}
+
+// timestamp is a tiny helper for embedding a Unix time into a JSON
+// literal in a test.
+func timestamp(t time.Time) string { return fmt.Sprintf("%d", t.Unix()) }
