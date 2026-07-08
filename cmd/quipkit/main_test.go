@@ -7,8 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rwrife/quipkit/internal/clip"
+	"github.com/rwrife/quipkit/internal/config"
+	"github.com/rwrife/quipkit/internal/typeit"
 )
 
 // withEnv temporarily sets an env var and restores it on cleanup.
@@ -190,5 +193,148 @@ func TestClipboardWiring_ReturnsUnavailableError(t *testing.T) {
 	// copyToClipboard still returns an error we can bubble up.
 	if err := copyToClipboard("x"); err == nil {
 		t.Error("copyToClipboard err = nil, want error when unavailable")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// auto-type wiring
+// -----------------------------------------------------------------------------
+
+func TestResolveAutoType(t *testing.T) {
+	cases := []struct {
+		name string
+		cli  typeMode
+		cfg  config.File
+		want bool
+	}{
+		{"unset+no cfg", typeModeUnset, config.File{}, false},
+		{"unset+cfg true", typeModeUnset, config.File{AutoType: true, AutoTypeSet: true}, true},
+		{"unset+cfg false", typeModeUnset, config.File{AutoType: false, AutoTypeSet: true}, false},
+		{"force overrides cfg false", typeModeForce, config.File{AutoType: false, AutoTypeSet: true}, true},
+		{"reject overrides cfg true", typeModeReject, config.File{AutoType: true, AutoTypeSet: true}, false},
+		{"force with no cfg", typeModeForce, config.File{}, true},
+		{"reject with no cfg", typeModeReject, config.File{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveAutoType(tc.cli, tc.cfg); got != tc.want {
+				t.Errorf("resolveAutoType(%v,%+v) = %v, want %v", tc.cli, tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveTypeDelay(t *testing.T) {
+	cases := []struct {
+		cli, cfg int
+		want     time.Duration
+	}{
+		{-1, 0, 0},                      // nothing set
+		{-1, 25, 25 * time.Millisecond}, // cfg only
+		{0, 25, 0},                      // cli 0 explicitly wins ("no delay")
+		{40, 25, 40 * time.Millisecond}, // cli wins over cfg
+		{100, 0, 100 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		got := resolveTypeDelay(tc.cli, tc.cfg)
+		if got != tc.want {
+			t.Errorf("resolveTypeDelay(%d,%d) = %v, want %v", tc.cli, tc.cfg, got, tc.want)
+		}
+	}
+}
+
+func TestRun_TypeAndNoTypeConflict(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	code := run([]string{"--type", "--no-type", "list"}, &out, &errBuf)
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "mutually exclusive") {
+		t.Errorf("stderr missing conflict message: %q", errBuf.String())
+	}
+}
+
+func TestRun_ListIgnoresAutoTypeFlags(t *testing.T) {
+	// --type applies to the picker; `list` should still work unchanged.
+	dir := t.TempDir()
+	withEnv(t, "QUIPKIT_DIR", dir)
+
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"add", "--file", "one", "hello"}, &out, &errBuf); code != 0 {
+		t.Fatalf("add exit = %d (stderr=%q)", code, errBuf.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	code := run([]string{"--type", "--type-delay-ms", "10", "list"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("list exit = %d (stderr=%q)", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "one") && !strings.Contains(out.String(), "hello") {
+		t.Errorf("list didn't include our snippet:\n%s", out.String())
+	}
+}
+
+// withStubbedTyping swaps the CLI's type hooks so tests don't invoke
+// real keystroke-injection binaries. Mirrors withStubbedClipboard.
+func withStubbedTyping(t *testing.T, available bool, backend string, typeFn func(string, typeit.Options) error) (*string, *typeit.Options) {
+	t.Helper()
+	prevType := typeText
+	prevAvail := typeAvailable
+	prevBackend := typeBackendName
+	last := new(string)
+	lastOpts := new(typeit.Options)
+	if typeFn == nil {
+		typeFn = func(s string, o typeit.Options) error {
+			*last = s
+			*lastOpts = o
+			return nil
+		}
+	} else {
+		orig := typeFn
+		typeFn = func(s string, o typeit.Options) error {
+			*last = s
+			*lastOpts = o
+			return orig(s, o)
+		}
+	}
+	typeText = typeFn
+	typeAvailable = func() bool { return available }
+	typeBackendName = func() string { return backend }
+	t.Cleanup(func() {
+		typeText = prevType
+		typeAvailable = prevAvail
+		typeBackendName = prevBackend
+	})
+	return last, lastOpts
+}
+
+func TestTypingWiring_RoundTripsThroughStub(t *testing.T) {
+	got, opts := withStubbedTyping(t, true, "xdotool", nil)
+	if err := typeText("hello", typeit.Options{Delay: 5 * time.Millisecond}); err != nil {
+		t.Fatalf("typeText: %v", err)
+	}
+	if *got != "hello" {
+		t.Errorf("stub saw %q, want hello", *got)
+	}
+	if opts.Delay != 5*time.Millisecond {
+		t.Errorf("stub saw delay=%v, want 5ms", opts.Delay)
+	}
+	if !typeAvailable() {
+		t.Error("typeAvailable() = false, want true when stubbed available")
+	}
+	if typeBackendName() != "xdotool" {
+		t.Errorf("typeBackendName() = %q, want xdotool", typeBackendName())
+	}
+}
+
+func TestTypingWiring_UnavailableIsReported(t *testing.T) {
+	withStubbedTyping(t, false, "", func(string, typeit.Options) error {
+		return errors.New("should not be called")
+	})
+	if typeAvailable() {
+		t.Fatal("typeAvailable() should be false")
+	}
+	if typeBackendName() != "" {
+		t.Errorf("typeBackendName() = %q, want empty", typeBackendName())
 	}
 }

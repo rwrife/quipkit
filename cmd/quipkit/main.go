@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-isatty"
 
@@ -17,7 +18,36 @@ import (
 	"github.com/rwrife/quipkit/internal/placeholders"
 	"github.com/rwrife/quipkit/internal/store"
 	"github.com/rwrife/quipkit/internal/tui"
+	"github.com/rwrife/quipkit/internal/typeit"
 )
+
+// typeMode captures how the CLI-level --type / --no-type flags interact
+// with the config file's `auto_type` default. It's tri-state because
+// there's a real difference between "user explicitly said no" and "user
+// didn't say anything, so honor the config".
+type typeMode int
+
+const (
+	typeModeUnset  typeMode = iota // no flag passed — fall back to config
+	typeModeForce                  // --type
+	typeModeReject                 // --no-type
+)
+
+// resolveAutoType folds the CLI flag and config default into a single
+// bool. Extracted from run() so both `cmdTUI` and the tests can call
+// it without going through the flag parser.
+func resolveAutoType(cli typeMode, cfg config.File) bool {
+	switch cli {
+	case typeModeForce:
+		return true
+	case typeModeReject:
+		return false
+	}
+	if cfg.AutoTypeSet {
+		return cfg.AutoType
+	}
+	return false
+}
 
 // Version is the quipkit version string. Overridable via -ldflags "-X main.Version=...".
 var Version = "0.1.0-dev"
@@ -37,6 +67,20 @@ var copyToClipboard = clip.Copy
 // clipboardAvailable reports whether the system exposes a clipboard.
 // Also swappable in tests.
 var clipboardAvailable = clip.Available
+
+// typeText is the auto-type entrypoint. Kept as a package var so tests
+// can swap it and cmdTUI doesn't have to import the typeit shell-out
+// path directly.
+var typeText = typeit.Type
+
+// typeAvailable reports whether a keystroke-injection backend is
+// installed. Package var so tests can swap it.
+var typeAvailable = typeit.Available
+
+// typeBackendName returns the resolved backend name (e.g. "xdotool"),
+// or "" when none is available. Used for the copied/typed confirmation
+// line so users can see which tool actually did the typing.
+var typeBackendName = func() string { return typeit.Detect().Name }
 
 // runEditor spawns the configured editor against the given file path.
 // It's a package var so tests can stub it out without invoking a real
@@ -62,9 +106,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("quipkit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	versionFlag := fs.Bool("version", false, "print version and exit")
+	typeFlag := fs.Bool("type", false, "type the picked snippet via OS keystroke injection instead of copying")
+	noTypeFlag := fs.Bool("no-type", false, "force clipboard mode even if the config enables auto-type")
+	typeDelayFlag := fs.Int("type-delay-ms", -1, "per-keystroke delay for --type mode in milliseconds (>=0)")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "quipkit %s\n", Version)
-		fmt.Fprintln(stderr, "usage: quipkit [--version] [command] [args]")
+		fmt.Fprintln(stderr, "usage: quipkit [--version] [--type|--no-type] [--type-delay-ms N] [command] [args]")
 		fmt.Fprintln(stderr, "commands:")
 		fmt.Fprintln(stderr, "  (default)       launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
 		fmt.Fprintln(stderr, "  list            list snippets (title\\ttags), pipe-friendly")
@@ -73,6 +120,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  edit [query]    open a snippet in $EDITOR (fuzzy picks the top match, or opens picker on a TTY)")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR, config `snippet_dir`, or ~/.quipkit")
 		fmt.Fprintln(stderr, "config file: $XDG_CONFIG_HOME/quipkit/config or ~/.config/quipkit/config")
+		fmt.Fprintln(stderr, "auto-type: --type / --no-type (config `auto_type`), --type-delay-ms (config `type_delay_ms`)")
 	}
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -81,6 +129,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if *versionFlag {
 		fmt.Fprintf(stdout, "quipkit %s\n", Version)
 		return 0
+	}
+
+	if *typeFlag && *noTypeFlag {
+		fmt.Fprintln(stderr, "quipkit: --type and --no-type are mutually exclusive")
+		return 2
+	}
+	mode := typeModeUnset
+	switch {
+	case *typeFlag:
+		mode = typeModeForce
+	case *noTypeFlag:
+		mode = typeModeReject
 	}
 
 	cfgFile, err := config.LoadFile()
@@ -114,7 +174,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch cmd {
 	case "tui":
-		return cmdTUI(dir, stdout, stderr)
+		return cmdTUI(dir, cfgFile, tuiOptions{typeMode: mode, typeDelayMs: *typeDelayFlag}, stdout, stderr)
 	case "list":
 		return cmdList(dir, stdout, stderr)
 	case "find":
@@ -339,15 +399,23 @@ func resolveEditTarget(snips []store.Snippet, id string, args []string, stderr i
 	return &s, 0
 }
 
+// tuiOptions carries the CLI-level knobs that affect how the picker's
+// result is delivered (clipboard vs. keystrokes, per-keystroke delay).
+type tuiOptions struct {
+	typeMode    typeMode
+	typeDelayMs int // -1 when the flag wasn't provided
+}
+
 // cmdTUI launches the interactive picker. On successful selection, it
 // renders any {{placeholders}} in the snippet body (using autofill
 // values, an optional vars.yaml in the snippet dir, and any prompts
-// the picker collected) and copies the result to the clipboard. When
-// no clipboard backend is available (bare Linux server, etc.) it falls
-// back to printing the rendered body to stdout with a hint on stderr
-// so the user can still pipe or paste manually. On cancel or empty
-// state, it exits 0 with no output.
-func cmdTUI(dir string, stdout, stderr io.Writer) int {
+// the picker collected) and delivers the result: either typing it via
+// OS keystroke injection (when --type / config `auto_type` is on) or
+// copying to the system clipboard. When neither backend is available,
+// it falls back to printing the rendered body to stdout with a hint on
+// stderr so the user can still pipe or paste manually. On cancel or
+// empty state, it exits 0 with no output.
+func cmdTUI(dir string, cfg config.File, opts tuiOptions, stdout, stderr io.Writer) int {
 	snips, err := store.Load(dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
@@ -382,6 +450,51 @@ func cmdTUI(dir string, stdout, stderr io.Writer) int {
 	}
 	title := res.Selected.Title
 
+	if resolveAutoType(opts.typeMode, cfg) {
+		return deliverByTyping(body, title, cfg, opts, res, stdout, stderr)
+	}
+	return deliverByClipboard(body, title, res, stdout, stderr)
+}
+
+// deliverByTyping is the auto-type branch of cmdTUI's delivery step.
+// Extracted so the clipboard path stays readable and so a future
+// non-TUI command (say, `quipkit type <query>`) can reuse it.
+func deliverByTyping(body, title string, cfg config.File, opts tuiOptions, res tui.Result, stdout, stderr io.Writer) int {
+	if !typeAvailable() {
+		fmt.Fprintf(stderr, "quipkit: auto-type requested but no backend available\n")
+		// Still surface the body so the user isn't stuck; hint via
+		// typeit.Type's wrapped error which includes an install command.
+		if _, werr := tui.WriteSelected(stdout, res); werr != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", werr)
+			return 1
+		}
+		if err := typeText(body, typeit.Options{}); err != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		}
+		return 1
+	}
+
+	delay := resolveTypeDelay(opts.typeDelayMs, cfg.TypeDelayMs)
+	if err := typeText(body, typeit.Options{Delay: delay}); err != nil {
+		fmt.Fprintf(stderr, "quipkit: type failed: %v\n", err)
+		if _, werr := tui.WriteSelected(stdout, res); werr != nil {
+			fmt.Fprintf(stderr, "quipkit: %v\n", werr)
+			return 1
+		}
+		return 1
+	}
+	backend := typeBackendName()
+	if backend == "" {
+		fmt.Fprintf(stderr, "typed %q\n", title)
+	} else {
+		fmt.Fprintf(stderr, "typed %q via %s\n", title, backend)
+	}
+	return 0
+}
+
+// deliverByClipboard is the original clipboard delivery path, extracted
+// verbatim so cmdTUI's dispatch stays a two-liner.
+func deliverByClipboard(body, title string, res tui.Result, stdout, stderr io.Writer) int {
 	if !clipboardAvailable() {
 		// No backend — dump the body so the user still gets value out of
 		// their pick, and explain how to get real clipboard support.
@@ -408,5 +521,18 @@ func cmdTUI(dir string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stderr, "copied %q to clipboard\n", title)
+	return 0
+}
+
+// resolveTypeDelay picks the effective per-keystroke delay from the CLI
+// flag and the config file. The CLI flag wins when set (>=0), otherwise
+// the config value is used, otherwise zero (no explicit delay).
+func resolveTypeDelay(cliMs, cfgMs int) time.Duration {
+	switch {
+	case cliMs >= 0:
+		return time.Duration(cliMs) * time.Millisecond
+	case cfgMs > 0:
+		return time.Duration(cfgMs) * time.Millisecond
+	}
 	return 0
 }

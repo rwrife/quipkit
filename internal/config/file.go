@@ -36,6 +36,19 @@ type File struct {
 	// Editor is the command to spawn for `quipkit edit`. May be a bare
 	// name ("vim") or include args ("code --wait").
 	Editor string
+	// AutoType, when true, makes `quipkit` default to typing the picked
+	// snippet via OS keystroke injection instead of copying to the
+	// clipboard. The CLI's `--type`/`--no-type` flags always override
+	// this per-invocation.
+	AutoType bool
+	// AutoTypeSet reports whether `auto_type` was present in the config
+	// file at all. Callers use this to distinguish "user explicitly set
+	// false" from "user didn't mention it" — matters because CLI
+	// negations (`--no-type`) shouldn't fight a nil default.
+	AutoTypeSet bool
+	// TypeDelayMs is the inter-keystroke delay for auto-type in
+	// milliseconds. 0 (or unset) means "no explicit delay".
+	TypeDelayMs int
 	// Path is the absolute path we loaded from; empty when no file was
 	// found (Load returns a zero File in that case).
 	Path string
@@ -94,6 +107,19 @@ func LoadFile() (File, error) {
 			out.SnippetDir = expandTilde(v)
 		case "editor":
 			out.Editor = v
+		case "auto_type", "auto-type", "autotype", "type":
+			b, err := parseBool(v)
+			if err != nil {
+				return File{}, fmt.Errorf("%s:%d: %s: %w", path, lineNo, k, err)
+			}
+			out.AutoType = b
+			out.AutoTypeSet = true
+		case "type_delay_ms", "type-delay-ms", "typedelayms":
+			n, err := parseNonNegInt(v)
+			if err != nil {
+				return File{}, fmt.Errorf("%s:%d: %s: %w", path, lineNo, k, err)
+			}
+			out.TypeDelayMs = n
 		default:
 			// Unknown keys are ignored on purpose so old binaries don't
 			// choke on new config keys.
@@ -188,4 +214,39 @@ func expandTilde(p string) string {
 		return p
 	}
 	return filepath.Join(home, p[2:])
+}
+
+// parseBool accepts the usual English affirmations/negations so users
+// don't have to remember whether we want "1", "true", or "yes". We
+// deliberately do not accept an empty string as false — an empty value
+// is almost always a config typo, and we'd rather complain than pick
+// a silent default.
+func parseBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("expected boolean (true/false/yes/no/1/0), got %q", v)
+}
+
+// parseNonNegInt parses a non-negative integer, rejecting negatives and
+// non-numeric input with a message that names the offending value.
+func parseNonNegInt(v string) (int, error) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return 0, fmt.Errorf("expected non-negative integer, got empty value")
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("expected non-negative integer, got %q", v)
+		}
+		n = n*10 + int(r-'0')
+		if n > 1<<30 {
+			return 0, fmt.Errorf("value %q is too large", v)
+		}
+	}
+	return n, nil
 }

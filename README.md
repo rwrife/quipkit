@@ -18,7 +18,7 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1–M5 landed and M6 polish is in flight — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR` or a config file), running `quipkit` in a terminal opens the interactive fuzzy picker, selecting **copies the snippet body to your system clipboard** and prints a `copied "…"` confirmation to stderr. `quipkit add` writes new snippets from the CLI, `quipkit edit` opens a snippet in `$EDITOR`, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1–M5 landed and M6 polish is in flight — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR` or a config file), running `quipkit` in a terminal opens the interactive fuzzy picker, selecting **copies the snippet body to your system clipboard** (or **types it as keystrokes** with `--type`) and prints a `copied "…"` / `typed "…"` confirmation to stderr. `quipkit add` writes new snippets from the CLI, `quipkit edit` opens a snippet in `$EDITOR`, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Install
 
@@ -41,6 +41,8 @@ Release archives (`quipkit_<version>_<os>_<arch>.tar.gz` / `.zip` on Windows) ar
 make build                        # produces ./quipkit
 ./quipkit --version               # prints version
 ./quipkit                         # interactive picker (TTY) → copies pick to clipboard
+./quipkit --type                  # same, but type the pick as keystrokes instead
+./quipkit --type --type-delay-ms 15  # add a per-keystroke delay for finicky targets
 ./quipkit list                    # seeds ~/.quipkit on first run, then lists snippets
 ./quipkit find addr               # ranked fuzzy search (title > tags > body)
 ./quipkit add "Hey, thanks!" --title "Quick thanks" --tags casual,reply
@@ -78,16 +80,39 @@ Zero-config by default. Drop a file at `$XDG_CONFIG_HOME/quipkit/config` (or `~/
 
 ```ini
 # ~/.config/quipkit/config
-snippet_dir = ~/notes/quips
-editor      = "code --wait"
+snippet_dir   = ~/notes/quips
+editor        = "code --wait"
+auto_type     = yes   # default to keystroke injection instead of clipboard
+type_delay_ms = 10    # per-keystroke pause for --type mode (0 = no delay)
 ```
 
-Syntax: `key = value` or `key: value`, `#` starts a comment, values can be quoted, `~/` expands to your home dir. Unknown keys are ignored so newer options don't break older binaries.
+Syntax: `key = value` or `key: value`, `#` starts a comment, values can be quoted, `~/` expands to your home dir. Unknown keys are ignored so newer options don't break older binaries. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
 
 Precedence — first thing set wins:
 
 - **Snippet dir:** `$QUIPKIT_DIR` → config `snippet_dir` → `~/.quipkit`
 - **Editor:** `$VISUAL` → `$EDITOR` → config `editor` → `vi`
+- **Auto-type:** `--type` / `--no-type` → config `auto_type` → clipboard
+- **Type delay:** `--type-delay-ms N` → config `type_delay_ms` → 0 (backend default)
+
+## Auto-type mode
+
+Some apps (looking at you, certain Electron chat clients) refuse to accept clipboard paste, or you might just not want to clobber the clipboard. `quipkit --type` picks a snippet the usual way, then types it into the currently focused window via OS-native keystroke injection:
+
+- **macOS:** `osascript` (System Events → `keystroke`). Requires that your terminal has **Accessibility** permission — grant it in *System Settings → Privacy & Security → Accessibility*, then re-launch the terminal.
+- **Linux:** first of `wtype` (Wayland), `ydotool`, or `xdotool` (X11) found on `$PATH`. Install one:
+  ```bash
+  sudo apt install xdotool          # X11
+  sudo apt install wtype            # Wayland (Sway, Hyprland, GNOME/KDE Wayland)
+  # ydotool needs uinput permission; see its README for setup.
+  ```
+- **Windows:** `powershell.exe` / `pwsh` (`System.Windows.Forms.SendKeys`). No install required.
+
+**Timing:** if characters get dropped, add a small pause with `--type-delay-ms 10` (or set `type_delay_ms = 10` in config). Values below 1 ms are clamped to 1 ms because none of the backends honor sub-millisecond delays.
+
+**Focus:** quipkit does not try to be clever about focus. Whatever window has keyboard focus when the picker exits gets the keystrokes — so pick your snippet, alt-tab (or click) to the target, then confirm. On most desktops the terminal will lose focus automatically when the picker closes.
+
+**No backend? No problem.** If nothing suitable is on `$PATH`, `--type` prints the snippet to stdout and a hint on stderr explaining what to install — the pick isn't lost.
 
 ## Planned usage
 
