@@ -122,6 +122,7 @@ quipkit add "text"   # stash a new snippet (optionally --tags work,reply)
 quipkit edit [q]     # open a snippet in $EDITOR (fuzzy match, or picker on a TTY)
 quipkit list         # print all snippets (pipe-friendly)
 quipkit find <query> # non-interactive ranked search
+quipkit stats        # show most-used snippets (frecency-ranked)
 ```
 
 Snippets live in `~/.quipkit/*.md`, optionally with frontmatter:
@@ -168,6 +169,16 @@ team:      platform
 ```
 
 Values in `vars.yaml` don't override anything you set at prompt time — they're just baseline defaults so common tokens (your name, signature, team) don't get asked about every time. Syntax matches the config file: `key: value` / `key = value`, `#` for comments, values may be quoted.
+
+## Frecency ranking
+
+quipkit keeps a tiny local record of which snippets you actually pick so the ones you use most — recently — float to the top. It's the classic **freq × recency** blend: usage count multiplied by an exponential decay (2-week half-life by default) on the last-used timestamp.
+
+- **Empty query in the TUI**: snippets are ordered by frecency, most-used first. Never-picked snippets keep their alphabetical order and appear below the ranked ones — so on day one the library still looks predictable.
+- **Non-empty query**: frecency *nudges* the fuzzy ranking. It'll break ties between similarly-scored matches and lift familiar snippets above random fuzzy hits, but it can never leapfrog a snippet whose title contains the query as an exact whole word.
+- **`quipkit stats`**: prints the top snippets by frecency, one per line as `title\tcount\tage` (e.g. `Friendly decline\t7\t3h ago`). Read-only — safe to run from a heartbeat or a dashboard. Pass `--limit N` to change how many rows print (0 = all).
+
+Usage state lives in `<snippet-dir>/.state.json`. It's plain JSON, human-editable, and safe to delete: the next `quipkit` invocation just starts fresh. Add it to `.gitignore` if you version-control your snippet folder and want per-machine rather than shared frecency.
 
 ## Tech
 

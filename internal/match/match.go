@@ -18,6 +18,7 @@
 package match
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/rwrife/quipkit/internal/store"
@@ -37,6 +38,23 @@ const (
 	bonusTitleToken = 1000.0
 	bonusTagToken   = 800.0
 	bonusBodyToken  = 200.0
+
+	// Frecency contribution when a text query is present.
+	//
+	// For an empty query, frecency is the entire ordering signal — no
+	// fuzzy score to blend with — so the raw score is used unchanged.
+	//
+	// For a non-empty query we want frecency to *nudge* the ranking,
+	// not dominate it: it should break ties between similarly-scored
+	// matches, and lift a familiar snippet ahead of a random fuzzy hit,
+	// but it must never let a widely-used snippet leapfrog a snippet
+	// whose title contains the query as an exact whole word. That's
+	// why we scale then hard-cap: whatever the raw popularity, the
+	// query-mode contribution can't exceed frecencyMaxQueryBoost, which
+	// is deliberately less than [bonusTagToken] so an exact-token match
+	// on any field still wins.
+	frecencyWeightQuery   = 50.0
+	frecencyMaxQueryBoost = 300.0
 )
 
 // Rank returns the input snippets ordered by fuzzy relevance to query.
@@ -46,10 +64,37 @@ const (
 //
 // Snippets that don't match on any field are omitted from the result.
 func Rank(query string, in []store.Snippet) []store.Snippet {
+	return RankWithFrecency(query, in, nil)
+}
+
+// FrecencyFn returns a non-negative recency-weighted "popularity"
+// score for a snippet. Zero means "no signal" — the snippet will be
+// ordered purely by its fuzzy score (or, on an empty query, by its
+// existing position). Callers usually get this by passing
+// (*frecency.Values).Score, but any pure func works and the match
+// package deliberately doesn't import frecency to avoid a cycle.
+type FrecencyFn func(id string) float64
+
+// RankWithFrecency is [Rank] with an optional frecency blend.
+//
+// When frec is nil, the behaviour is identical to Rank.
+//
+// When frec is non-nil:
+//
+//   - Empty/whitespace query: snippets are ordered by their frecency
+//     score (highest first). Snippets with a zero score keep their
+//     input order and appear after the ranked ones — so a brand-new
+//     snippet library still shows up in a predictable order and the
+//     "one keystroke away" ordering only kicks in once you've
+//     actually used something.
+//   - Non-empty query: frecency scales the fuzzy score modestly
+//     (see frecencyWeightQuery), enough to break ties between
+//     similarly-scored matches but not enough to leapfrog a much
+//     stronger textual match.
+func RankWithFrecency(query string, in []store.Snippet, frec FrecencyFn) []store.Snippet {
 	q := strings.TrimSpace(query)
 	if q == "" {
-		// Preserve caller's ordering (typically store.Load's stable ID sort).
-		return in
+		return rankByFrecency(in, frec)
 	}
 	if len(in) == 0 {
 		return nil
@@ -60,6 +105,13 @@ func Rank(query string, in []store.Snippet) []store.Snippet {
 		score, ok := scoreSnippet(q, s)
 		if !ok {
 			continue
+		}
+		if frec != nil {
+			boost := frec(s.ID) * frecencyWeightQuery
+			if boost > frecencyMaxQueryBoost {
+				boost = frecencyMaxQueryBoost
+			}
+			score += boost
 		}
 		scored = append(scored, scoredSnippet{
 			snip:   s,
@@ -75,6 +127,47 @@ func Rank(query string, in []store.Snippet) []store.Snippet {
 	for i, ss := range scored {
 		out[i] = ss.snip
 	}
+	return out
+}
+
+// rankByFrecency handles the empty-query path: sort snippets whose
+// frecency score is > 0 in descending score order, then append the
+// zero-score snippets in their original input order. The returned
+// slice always has the same length as the input.
+func rankByFrecency(in []store.Snippet, frec FrecencyFn) []store.Snippet {
+	if frec == nil || len(in) == 0 {
+		return in
+	}
+	type withScore struct {
+		s     store.Snippet
+		score float64
+		idx   int
+	}
+	ranked := make([]withScore, 0, len(in))
+	unused := make([]store.Snippet, 0, len(in))
+	for i, s := range in {
+		score := frec(s.ID)
+		if score > 0 {
+			ranked = append(ranked, withScore{s: s, score: score, idx: i})
+		} else {
+			unused = append(unused, s)
+		}
+	}
+	if len(ranked) == 0 {
+		return in
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		// Tie: preserve input order for deterministic UI.
+		return ranked[i].idx < ranked[j].idx
+	})
+	out := make([]store.Snippet, 0, len(in))
+	for _, r := range ranked {
+		out = append(out, r.s)
+	}
+	out = append(out, unused...)
 	return out
 }
 
