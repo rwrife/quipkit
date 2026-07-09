@@ -18,7 +18,7 @@ $ quipkit
 
 ## Status
 
-🚧 Early. M1–M5 landed and M6 polish is in flight — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR` or a config file), running `quipkit` in a terminal opens the interactive fuzzy picker, selecting **copies the snippet body to your system clipboard** (or **types it as keystrokes** with `--type`) and prints a `copied "…"` / `typed "…"` confirmation to stderr. `quipkit add` writes new snippets from the CLI, `quipkit edit` opens a snippet in `$EDITOR`, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
+🚧 Early. M1–M5 landed and M6 polish is in flight — on first run, `quipkit` seeds 5 example snippets into `~/.quipkit` (override with `QUIPKIT_DIR` or a config file), running `quipkit` in a terminal opens the interactive fuzzy picker, selecting **copies the snippet body to your system clipboard** (or **types it as keystrokes** with `--type`) and prints a `copied "…"` / `typed "…"` confirmation to stderr. `quipkit add` writes new snippets from the CLI, `quipkit edit` opens a snippet in `$EDITOR`, `quipkit --set <name>` switches to a namespaced library under `sets/`, and pipe-friendly `quipkit list` / `quipkit find <query>` still work non-interactively. See [`PLAN.md`](./PLAN.md) for the roadmap and [issues](https://github.com/rwrife/quipkit/issues) for milestones.
 
 ## Install
 
@@ -74,6 +74,31 @@ quipkit edit --id signoff     # explicit: open the snippet with that file base n
 
 Or without make: `go build ./cmd/quipkit` / `go run ./cmd/quipkit --version`.
 
+## Snippet sets
+
+Sets are switchable snippet libraries — keep `work` macros out of your `personal` replies and vice versa. A set is just a subfolder under `<snippetDir>/sets/`:
+
+```
+~/.quipkit/
+  greeting.md            # base library (used when no set is active)
+  sets/
+    work/*.md            # `--set work`
+    support/*.md         # `--set support`
+    personal/*.md        # `--set personal`
+```
+
+Manage sets:
+
+```bash
+quipkit sets                 # list sets and their snippet counts
+quipkit sets create work     # create + seed a new set folder
+quipkit --set work           # launch the picker against `work`
+quipkit --set work add "…"   # add a snippet into `work`
+QUIPKIT_SET=support quipkit  # persist the choice for a shell session
+```
+
+Set names must be `[a-zA-Z0-9_-]+` (so `--set ../oops` gets rejected instead of escaping the snippet dir). The reserved name `default` is an alias for the base library. Set the default globally with `default_set = work` in the config file; `--set` and `$QUIPKIT_SET` always override it.
+
 ## Configuration
 
 Zero-config by default. Drop a file at `$XDG_CONFIG_HOME/quipkit/config` (or `~/.config/quipkit/config`) to override the snippet directory and/or editor:
@@ -84,6 +109,7 @@ snippet_dir   = ~/notes/quips
 editor        = "code --wait"
 auto_type     = yes   # default to keystroke injection instead of clipboard
 type_delay_ms = 10    # per-keystroke pause for --type mode (0 = no delay)
+default_set   = work  # snippet set to use when --set / $QUIPKIT_SET aren't set
 ```
 
 Syntax: `key = value` or `key: value`, `#` starts a comment, values can be quoted, `~/` expands to your home dir. Unknown keys are ignored so newer options don't break older binaries. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`.
@@ -91,6 +117,7 @@ Syntax: `key = value` or `key: value`, `#` starts a comment, values can be quote
 Precedence — first thing set wins:
 
 - **Snippet dir:** `$QUIPKIT_DIR` → config `snippet_dir` → `~/.quipkit`
+- **Snippet set:** `--set NAME` → `$QUIPKIT_SET` → config `default_set` → base library
 - **Editor:** `$VISUAL` → `$EDITOR` → config `editor` → `vi`
 - **Auto-type:** `--type` / `--no-type` → config `auto_type` → clipboard
 - **Type delay:** `--type-delay-ms N` → config `type_delay_ms` → 0 (backend default)

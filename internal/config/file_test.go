@@ -187,6 +187,20 @@ func TestEditorPrecedence(t *testing.T) {
 	}
 }
 
+func TestLoadFileParsesDefaultSet(t *testing.T) {
+	_, path := withConfigDir(t)
+	if err := os.WriteFile(path, []byte("default_set = work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatalf("LoadFile err: %v", err)
+	}
+	if got.DefaultSet != "work" {
+		t.Fatalf("DefaultSet = %q, want %q", got.DefaultSet, "work")
+	}
+}
+
 func TestLoadFileParsesAutoType(t *testing.T) {
 	_, path := withConfigDir(t)
 	body := "auto_type = yes\ntype_delay_ms = 15\n"
