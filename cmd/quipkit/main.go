@@ -124,12 +124,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("quipkit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	versionFlag := fs.Bool("version", false, "print version and exit")
+	setFlag := fs.String("set", "", "snippet set to use (folder under <snippetDir>/sets/); overrides $QUIPKIT_SET and config `default_set`")
 	typeFlag := fs.Bool("type", false, "type the picked snippet via OS keystroke injection instead of copying")
 	noTypeFlag := fs.Bool("no-type", false, "force clipboard mode even if the config enables auto-type")
 	typeDelayFlag := fs.Int("type-delay-ms", -1, "per-keystroke delay for --type mode in milliseconds (>=0)")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "quipkit %s\n", Version)
-		fmt.Fprintln(stderr, "usage: quipkit [--version] [--type|--no-type] [--type-delay-ms N] [command] [args]")
+		fmt.Fprintln(stderr, "usage: quipkit [--version] [--set NAME] [--type|--no-type] [--type-delay-ms N] [command] [args]")
 		fmt.Fprintln(stderr, "commands:")
 		fmt.Fprintln(stderr, "  (default)       launch interactive fuzzy picker (falls back to `list` when stdout is not a TTY)")
 		fmt.Fprintln(stderr, "  list            list snippets (title\\ttags), pipe-friendly")
@@ -137,7 +138,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "  add <text>      write a new snippet (flags: --title, --tags a,b)")
 		fmt.Fprintln(stderr, "  edit [query]    open a snippet in $EDITOR (fuzzy picks the top match, or opens picker on a TTY)")
 		fmt.Fprintln(stderr, "  stats [--limit N] show most-used snippets by frecency")
+		fmt.Fprintln(stderr, "  sets [create N] list snippet sets (subcmd: create <name>)")
 		fmt.Fprintln(stderr, "snippet dir: $QUIPKIT_DIR, config `snippet_dir`, or ~/.quipkit")
+		fmt.Fprintln(stderr, "snippet set: --set, $QUIPKIT_SET, config `default_set` (folder under <snippetDir>/sets/)")
 		fmt.Fprintln(stderr, "config file: $XDG_CONFIG_HOME/quipkit/config or ~/.config/quipkit/config")
 		fmt.Fprintln(stderr, "auto-type: --type / --no-type (config `auto_type`), --type-delay-ms (config `type_delay_ms`)")
 	}
@@ -167,13 +170,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
 	}
-	dir, err := config.ResolveSnippetDir(cfgFile)
+	baseDir, err := config.ResolveSnippetDir(cfgFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
 	}
+	setName := config.ResolveSetWithOverride(cfgFile, *setFlag)
+	dir, err := config.EffectiveDir(baseDir, setName)
+	if err != nil {
+		fmt.Fprintf(stderr, "quipkit: %v\n", err)
+		return 2
+	}
 
-	// Seed examples on first run (no-op if any snippets exist).
+	// `sets` is a meta-command: it operates on the base dir regardless
+	// of the active set, so dispatch it before the seed step (an empty
+	// set folder shouldn't get auto-seeded just because the user asked
+	// for a listing).
+	if fs.NArg() > 0 && fs.Arg(0) == "sets" {
+		return cmdSets(baseDir, fs.Args()[1:], stdout, stderr)
+	}
+
+	// Seed examples on first run (no-op if any snippets exist). When a
+	// set is active, this seeds *that set's* folder — a brand-new
+	// `--set work` gets its own starter snippets instead of an empty
+	// picker.
 	if _, err := store.Seed(dir); err != nil {
 		fmt.Fprintf(stderr, "quipkit: %v\n", err)
 		return 1
@@ -204,6 +224,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdEdit(dir, cfgFile, fs.Args()[1:], stdout, stderr)
 	case "stats":
 		return cmdStats(dir, fs.Args()[1:], stdout, stderr)
+	case "sets":
+		// Handled above, but keep the case so the switch is exhaustive
+		// and `quipkit sets` isn't reported as an unknown command in the
+		// (unreachable) fallthrough.
+		return cmdSets(baseDir, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "quipkit: unknown command %q\n", cmd)
 		return 2

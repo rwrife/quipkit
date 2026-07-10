@@ -49,6 +49,12 @@ type File struct {
 	// TypeDelayMs is the inter-keystroke delay for auto-type in
 	// milliseconds. 0 (or unset) means "no explicit delay".
 	TypeDelayMs int
+	// DefaultSet is the snippet set to select by default when neither
+	// $QUIPKIT_SET nor `--set` is provided. Empty means "use the base
+	// library" (the un-namespaced snippets at the root of the snippet
+	// directory). The reserved alias "default" also resolves to the
+	// base library.
+	DefaultSet string
 	// Path is the absolute path we loaded from; empty when no file was
 	// found (Load returns a zero File in that case).
 	Path string
@@ -114,6 +120,8 @@ func LoadFile() (File, error) {
 			}
 			out.AutoType = b
 			out.AutoTypeSet = true
+		case "default_set", "default-set", "defaultset", "set":
+			out.DefaultSet = v
 		case "type_delay_ms", "type-delay-ms", "typedelayms":
 			n, err := parseNonNegInt(v)
 			if err != nil {
